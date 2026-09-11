@@ -7,6 +7,7 @@ from catalog.models.order import Order
 from catalog.models.orderline import OrderLine
 from catalog.repositories.orderline_repository import OrderLineRepository
 from catalog.repositories.pricing_repository import PricingRepository as pricing_repo
+from catalog.repositories.product_repository import ProductRepository as product_repo
 
 class OrderService:
     def __init__(self, order_repo, orderline_repo):
@@ -46,11 +47,10 @@ class OrderService:
                 # 2. Extract and remove order-specific fields from the dict
                 # Using .pop(key, default_value) ensures it won't crash if missing
                 quantity = product_fields.pop("quantity", 1)
-
-                # This is a correct placeholder for now
-                # Correct implementaion would be to access it from Pricing.pricing_rule
-                # As the unit_price should have been set at product creation
-                unit_price = product_fields.pop("unit_price", 0.0)  # placeholder
+                unit_price = product_fields.pop("unit_price", 0.0) if product_fields.get("unit_price") else \
+                    pricing_repo.get_price(product_fields["name"]) or \
+                        product_repo.check_product_unit_price(product_fields["name"])      # Need to fix the add_price method to add to the Product object
+                        # So that the price retrieval is from a single source of truth of avoid errors
 
                 # 3. Now product_fields only contains actual product parameters!
                 new_product = ProductConfiguration(**product_fields)
@@ -76,8 +76,14 @@ class OrderService:
 
             # iii. Grab the name string from the dataclass
             product_name = product_dataclass.name     # compact one-liner - line.product_configuration.product.name
-            print(f"{product_name} | {line.quantity} | ${line.unit_price}  \
-                  ->  {pricing_repo.total(line.unit_price * line.quantity)}")
+
+            # iv. Grab the product unit price from the dataclass
+            tiers = product_dataclass.unit_price    # list of PricingRule
+            for tier in tiers:
+                if quantity <= tier.max_quantity:
+                    unit_price = tier.unit_price
+                    print(f"{product_name} | {line.quantity} | ${line.unit_price}  \
+                        ->  {pricing_repo.total(line.unit_price * line.quantity)}")       
 
         # 6. clear the orderlines after saving 
         # for potential new operations

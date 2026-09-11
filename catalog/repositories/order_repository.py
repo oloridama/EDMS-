@@ -1,9 +1,13 @@
 from catalog.models.order import Order
 
 class OrderRepository:
-    def __init__(self, orders):
+    def __init__(self, orders: list[Order] = None):
+        """
+        Repository layer for order operations
+        """
         self.orders = orders if orders else []
-        pass
 
     def add_order(self, order: Order):
+        """
+        Adds an order to the repository"""
         self.orders.append(order)
