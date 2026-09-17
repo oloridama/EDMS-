@@ -1,25 +1,51 @@
+from catalog.models.category import Category
+from catalog.models.specification import Specification, SpecificationType, SpecificationValueType
 from catalog.repositories.category_repository import CategoryRepository
+from catalog.services.specification_service import SpecificationService
 from shared.logging import log
+from shared.error_handling import CategoryAlreadyExistsError
 
 class CategoryService:
-    def __init__(self, category_repo):
-        self.category_repo = category_repo if category_repo else CategoryRepository()
-        pass
+    def __init__(self, category_repo: CategoryRepository, spec_service: SpecificationService):
+        self.category_repo = category_repo
+        self.spec_service = spec_service
 
-    def add_to_category(self, product, category_name, category_desc):
-        try:
-            # check if category exists
-            if self.category_repo.category_exists(category_name):
-                self.category_repo.add_product_to_category(product)
-                log("Product added to category {category_name} successfully!")
-            else:
-                # Create category
-                self.category_repo.create_category(category_name, category_desc)
-                self.category_repo.add_product_to_category(product)
-                log("Product added to category {category_name} successfully!")
-        except:
-            # Log error message if theres an error from the user inputing wrong parameters
-            log("The operation failed due to: {NameError}", True)
+    def create_category(
+            self, 
+            category_name: str, 
+            specifications: list[Specification], 
+            category_desc: str | None = None
+        ):
+        """
+        Creates a new category using the CategoryRepository.
+            :param category_name: The name of the category to create
+            :param specifications: The specifications associated with the category
+            :param category_desc: Optional description of the category
+            :raises ValueError: If the category name is empty or whitespace
+            :raises CategoryAlreadyExistsError: If the category already exists
+        """
+        if not category_name:
+            raise ValueError("Category name cannot be empty.")
+        if category_name != category_name.strip():
+            raise ValueError("Category name cannot be empty or whitespace.")
+        existing, _ = self.category_repo.category_exists(category_name)
 
+        if existing is False:
+            raise CategoryAlreadyExistsError(f"Category '{category_name}' already exists.")
+
+        for spec in specifications:
+            if self.spec_service.validate_specification(spec) is False:
+                raise ValueError("Invalid specification provided.")
+        
+        category = Category(
+            name=category_name, 
+            specifications=specifications, 
+            description=category_desc
+        )
+        self.category_repo.save_category(category)
+        
     def get_product_category(self, product_name):
-            self.category_repo.check_product_category(product_name)
+        """
+        Retrieves the category of a product.
+        """
+        return self.category_repo.check_product_category(product_name)

@@ -90,6 +90,9 @@ class OrderService:
         order_lines.clear()
 
     def save_order(requester: str, orderlines: list) -> Order:
+        """
+        Saves the order to the order repository
+        """
         # Create Order object by initializing Order
         order = Order(requester, orderlines)
         return order

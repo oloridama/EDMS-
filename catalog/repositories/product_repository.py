@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from catalog.models.product import Product
+from catalog.models.product_configuration import ProductConfiguration
 from shared.logging import log
 
 class ProductRepository:
@@ -8,12 +9,17 @@ class ProductRepository:
     class object with methods for performing the business operations
     """
     def __init__(self, catalog: list[Product]):
+        """
+        Initializes the ProductRepository with an optional catalog of products.
+        :param catalog: A list of Product instances representing the product catalog
+        """
         self.catalog = catalog if catalog else []
 
     def add_product(self, product: Product):
         """
         The method handles the business operation of persisting \
         the product intended to be added when called
+        :param product: An instance of Product to be added to the catalog
         """
         self.catalog.append(product)
 
@@ -49,23 +55,3 @@ class ProductRepository:
             if product_name == product.name:
                 return product.unit_price 
         return None
-
-    def add_new_manufacturer(
-            self, 
-            product_name: str, 
-            manufacturer: str
-        ) -> None:
-        """
-        The method handles the addition of a new manufacturer \
-            to an existing product in the catalog
-            :param product_name: This is the name of the product \
-                to which the manufacturer is to be added
-            :param manufacturer: This is the name of the \
-                manufacturer to be added to the product
-        """
-        for product in self.catalog:
-            if product_name == product.name:
-                product.manufacturers.append(manufacturer)
-                log.info(f"Manufacturer {manufacturer} added to product {product_name}")
-                return
-        log.warning(f"Product not found: {product_name}")
