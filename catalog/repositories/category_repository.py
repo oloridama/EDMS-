@@ -1,45 +1,56 @@
-# this script handles the business operation of persisting categories that products fall into
-from catalog.models.product import Product
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
+
 from catalog.models.category import Category
-from catalog.repositories.product_repository import ProductRepository
-from shared.logging import log
+from catalog.repositories.mappers import category_from_record
+from catalog.repositories.records import CategoryRecord, ProductRecord, SpecificationTypeRecord
+from shared.error_handling import CategoryAlreadyExistsError
+
 
 class CategoryRepository:
-    def __init__(self, categories: list[Category]):
-        """
-        Repository layer for category operations
-        """
-        self.categories = categories
+    def __init__(self, db_session: Session):
+        self.db_session = db_session
 
-    def save_category(self, category: Category):
-        """
-        Method for creating a new category
-        It takes a name and desc arguments to call \
-            the category model in order to create the category
-        """
-        self.categories.append(category)
-        log(f"Category {category.name} created!")
+    def save_category(self, category: Category) -> int:
+        record = CategoryRecord(
+            name=category.name,
+            description=category.description,
+            specification_types=[
+                SpecificationTypeRecord(
+                    name=specification_type.name,
+                    value_type=specification_type.value_type.value,
+                    allowed_values=specification_type.allowed_values,
+                )
+                for specification_type in category.specification_types
+            ],
+        )
+        self.db_session.add(record)
+        try:
+            self.db_session.flush()
+        except IntegrityError as error:
+            self.db_session.rollback()
+            raise CategoryAlreadyExistsError(category.name) from error
+        return record.id
 
     def category_exists(self, category_name: str) -> tuple[bool, Category | None]:
-        """
-        Checks if a category exists in the list of categories
-        """
-        # Check the category names list
-        category = self.find_category(self.categories, category_name)
-        if category == None:
-            log(f"Category {category_name} not found! Create category first!")
-            return False, None
-        log(f"Category {category.name} exists!")
-        return True, category
+        statement = (
+            select(CategoryRecord)
+            .options(selectinload(CategoryRecord.specification_types))
+            .where(CategoryRecord.name == category_name)
+        )
+        record = self.db_session.scalar(statement)
+        return (record is not None, category_from_record(record) if record else None)
 
-    def find_category(categories: list, category_name: str) -> Category | None:
-        """
-        Finds a category by name in the list of categories
-        """
-        for category in categories:
-            if category.name == category_name:
-                return category
-        return None
+    def check_product_category(self, product_name: str) -> Category | None:
+        statement = (
+            select(ProductRecord)
+            .options(selectinload(ProductRecord.category))
+            .where(ProductRecord.name == product_name)
+        )
+        product = self.db_session.scalar(statement)
+        return category_from_record(product.category) if product else None
 
-
-
+    @staticmethod
+    def find_category(categories: list[Category], category_name: str) -> Category | None:
+        return next((category for category in categories if category.name == category_name), None)

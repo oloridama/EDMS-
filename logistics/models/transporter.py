@@ -10,3 +10,4 @@ class Transporter:
     marital_status: str | None # the marital status of the transporter company or driver, e.g. "Single", "Married", "Divorced", "Widowed"
     dob: str | None # the date of birth of the transporter company or driver, e.g. "YYYY-MM-DD"
     citizenship: str | None # the citizenship of the transporter company or driver, e.g. "USA", "Canada", "UK"
+    transporter_id: str | None = None

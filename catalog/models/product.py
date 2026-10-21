@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from catalog.models.category import Category
 from catalog.models.brand import Brand
-from catalog.models.product_configuration import ProductConfiguration
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from catalog.models.product_configuration import ProductConfiguration
 
 @dataclass
 class Product:

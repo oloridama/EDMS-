@@ -1,0 +1,19 @@
+# Python virtual environments
+.venv/
+venv/
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local databases
+*.db
+*.sqlite3
+
+# Archives and OS/editor noise
+edms.zip
+.DS_Store
+.idea/

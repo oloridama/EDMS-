@@ -11,7 +11,7 @@ class SpecificationValueType(Enum):
 class SpecificationType:
     name: str
     value_type: SpecificationValueType
-    allowed_values: list[str] = field(default_factory=list)
+    allowed_values: list[str | int | float | bool] = field(default_factory=list)
 
     def validate_value(
             self, 
@@ -23,15 +23,22 @@ class SpecificationType:
             :return: True if valid, False otherwise
         """
         if self.value_type == SpecificationValueType.ENUM:
-            return isinstance(value, str) and value in self.allowed_values
+            if not isinstance(value, str):
+                return False
         elif self.value_type == SpecificationValueType.NUMBER:
-            return isinstance(value, (int, float)) and not isinstance(value, bool)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return False
         elif self.value_type == SpecificationValueType.BOOLEAN:
-            return isinstance(value, bool)
+            if not isinstance(value, bool):
+                return False
         elif self.value_type == SpecificationValueType.TEXT:
-            return isinstance(value, str)
+            if not isinstance(value, str):
+                return False
         else:
             return False
+        if self.allowed_values and value not in self.allowed_values:
+            return False
+        return True
 
 @dataclass
 class Specification:

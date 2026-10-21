@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EDMS Python and Database Study Guide</title>
+<style>
+@page { size: A4; margin: 17mm 18mm 18mm; }
+body { font-family: "Liberation Sans", sans-serif; font-size: 10.5pt; line-height: 1.38; color: #202a33; }
+h1 { font-size: 26pt; color: #163b50; margin: 0 0 7mm; }
+h2 { font-size: 17pt; color: #176b68; border-bottom: 1px solid #96bcb5; padding-bottom: 2mm; margin-top: 9mm; }
+h3 { font-size: 12pt; color: #163b50; margin: 5mm 0 2mm; }
+p { margin: 2mm 0 3mm; }
+li { margin: 1.5mm 0; }
+pre { font-family: "Liberation Mono", monospace; font-size: 8.5pt; line-height: 1.25; background: #f0f4f3; border-left: 3px solid #176b68; padding: 3mm; white-space: pre-wrap; }
+code { font-family: "Liberation Mono", monospace; font-size: 9pt; color: #163b50; }
+.callout { background: #eaf2ef; border-left: 4px solid #176b68; padding: 3mm 4mm; margin: 4mm 0; }
+.small { font-size: 9pt; color: #53636b; }
+.page { page-break-before: always; }
+table { width: 100%; border-collapse: collapse; margin: 3mm 0 5mm; }
+th, td { border: 1px solid #aebbb9; padding: 2.5mm; text-align: left; vertical-align: top; }
+th { background: #eaf2ef; }
+</style>
+</head>
+<body>
+<h1>EDMS Python &amp; Database Study Guide</h1>
+<p><strong>A field guide to the Python, SQLAlchemy, FastAPI, and security concepts introduced while building EDMS.</strong></p>
+<p class="small">Use this as a reading companion, not a memorization test. Trace each example back to the source, rewrite it by hand, and predict what it returns before running it.</p>
+<div class="callout"><strong>Learning target:</strong> understand the mechanism behind the syntax well enough to rebuild the feature without copying it. The goal is a stronger mental model, not faster typing today.</div>
+<h2>1. The layers: business objects and database objects</h2>
+<p>A relational database stores rows in tables. Python works with objects. An ORM (object-relational mapper) maps between those worlds and tracks database objects through a session.</p>
+<table><tr><th>Kind</th><th>EDMS example</th><th>Responsibility</th></tr>
+<tr><td>Domain object</td><td><code>PurchaseOrder</code>, <code>PurchaseLine</code></td><td>Business meaning and behavior: approve an order, receive goods, calculate a line total, reject duplicates.</td></tr>
+<tr><td>ORM record</td><td><code>PurchaseOrderRecord</code>, <code>PurchaseOrderLineRecord</code></td><td>Table/column mapping, keys, constraints, and relationships understood by SQLAlchemy.</td></tr>
+<tr><td>Repository</td><td><code>PurchaseOrderRepository</code></td><td>Queries and persistence; translates a domain order to database records when saving.</td></tr>
+<tr><td>Session</td><td><code>Session</code></td><td>Unit of work: tracks loaded/new records and sends SQL within a transaction.</td></tr></table>
+<pre>PurchaseOrder domain object
+    -- map fields --> PurchaseOrderRecord + PurchaseOrderLineRecord
+    -- SQLAlchemy Session --> database rows</pre>
+<p>A dataclass does not become persistent just because it is an object. Changing a plain <code>PurchaseOrder</code> changes that in-memory object. A mapped ORM object is associated with SQLAlchemy's session; SQLAlchemy can notice changes and persist them when the transaction is flushed/committed.</p>
+<p>This project deliberately has separate domain and ORM classes. That protects business rules from database details, but means a repository must map between the two. Current read methods return ORM records: appropriate for a persistence-focused read path, but callers should know they are receiving ORM objects.</p>
+<h2>2. Tables, keys, and relationships</h2>
+<p>Think of each table as one kind of fact. A purchase order is the header; each purchase line is a separate row because one order can contain many lines.</p>
+<pre>purchase_orders
+  id (primary key)
+  supplier_name snapshot
+  status
+  total
+
+purchase_order_lines
+  id (primary key)
+  purchase_order_id (foreign key -> purchase_orders.id)
+  product_id
+  product_name snapshot
+  quantity, received_quantity
+  manufacturer_name snapshot
+  unit_price snapshot</pre>
+<ul>
+<li><strong>Primary key:</strong> identifies one row, such as <code>purchase_orders.id</code>.</li>
+<li><strong>Foreign key:</strong> requires a referenced row to exist. A line's <code>purchase_order_id</code> points to its owning order.</li>
+<li><strong>One-to-many:</strong> one order has many lines; each line belongs to one order.</li>
+<li><strong>Relationship:</strong> SQLAlchemy's Python-side navigation between mapped classes. It does not replace the foreign-key column; both describe different sides of the mapping.</li>
+</ul>
+<p><code>lines = relationship(...)</code> on the order record lets Python navigate <code>order.lines</code>. <code>purchase_order = relationship(...)</code> on a line lets Python navigate back. <code>back_populates</code> names the corresponding attribute on the other mapped class so SQLAlchemy keeps both sides aligned.</p>
+<h2>3. Why values are saved as snapshots</h2>
+<p>A purchase line records the terms agreed at a moment in time. If the catalog price or supplier details change later, old purchase orders should not silently change their historical meaning.</p>
+<ul>
+<li><code>unit_price</code> is the agreed unit price for this order line, not necessarily today's catalog price.</li>
+<li><code>product_name</code>, <code>manufacturer_name</code>, and <code>supplier_name</code> are saved copies as they were when the order was made.</li>
+<li><code>product_id</code> is the identity used to find the catalog product. A future schema may make it a foreign key; the copied name still serves as historical display text.</li>
+</ul>
+<p>The repository's save method constructs new ORM records using values from the domain objects. Those values are copied into the pending database records. Mutating the original domain objects after saving does not rewrite those snapshots automatically.</p>
+<div class="callout"><strong>Design question:</strong> decide which values mean “current master data” and which mean “what was true/agreed at transaction time.” IDs usually connect to master data; commercial terms and historical display values are often snapshotted.</div>
+<h2>4. Database constraints: the last line of defense</h2>
+<p>Python validation gives useful, immediate errors to normal application callers. Database constraints protect stored data even if another code path forgets that validation.</p>
+<ul>
+<li><code>CheckConstraint("quantity &gt; 0")</code>: quantity must be positive.</li>
+<li><code>CheckConstraint("received_quantity &gt;= 0 AND received_quantity &lt;= quantity")</code>: received quantity must stay within the ordered amount.</li>
+<li><code>CheckConstraint("unit_price &gt;= 0")</code>: a price cannot be negative.</li>
+<li><code>UniqueConstraint("purchase_order_id", "product_id")</code>: one product identity can occur at most once within one order.</li>
+</ul>
+<p>A unique constraint across two columns means their <em>pair</em> must be unique. The same product may appear on another order; the same order may contain other products. Domain validation in <code>PurchaseOrder.__post_init__</code> gives a friendly error before persistence, while the database constraint handles races or alternate writers.</p>
+<p>The duplicate rule assumes a product ID represents the exact thing that must not repeat. If two configurations of one base product may be ordered separately, the key should identify the configuration instead.</p>
+<p><strong>Schema caution:</strong> SQLAlchemy's <code>Base.metadata.create_all()</code> creates missing tables; it does not modify an existing table to add new constraints. Existing databases need a migration, and existing duplicate/invalid rows must be corrected before the constraint can be applied.</p>
+<h2>5. Indexes and practical query cost</h2>
+<p>An index is an extra data structure the database maintains to find rows by selected columns. It speeds matching reads but consumes storage and adds work to inserts/updates. Add indexes to serve known queries, not automatically to every column.</p>
+<p>The old lookup searched Python lists of orders and their lines. That meant visiting many objects and nested iteration. The current design asks the database for the line matching both its owning order and its product ID. The unique constraint on those columns also creates an index in common relational databases.</p>
+<p>Correction to the earlier shorthand: indexed database lookup is not generally O(1). A typical B-tree lookup is approximately O(log n), plus SQL execution and I/O costs. The important win here is that the application does not fetch and scan all orders and lines itself.</p>
+<h2>6. Reading SQLAlchemy's select syntax</h2>
+<p>SQLAlchemy 2.x builds a statement using Python expressions. Method chaining successively adds clauses to one statement.</p>
+<pre>statement = select(PurchaseOrderLineRecord).where(
+    PurchaseOrderLineRecord.purchase_order_id == purchase_order_id,
+    PurchaseOrderLineRecord.product_id == product_id,
+)
+line = session.scalar(statement)</pre>
+<table><tr><th>Expression</th><th>Meaning</th><th>SQL idea</th></tr>
+<tr><td><code>select(Model)</code></td><td>Build a statement selecting mapped instances of that model.</td><td><code>SELECT ... FROM ...</code></td></tr>
+<tr><td><code>.where(condition, condition)</code></td><td>Filter rows; multiple conditions are combined with AND.</td><td><code>WHERE a = ? AND b = ?</code></td></tr>
+<tr><td><code>.order_by(column)</code></td><td>Sort returned rows. It is <code>order_by</code>, not <code>order</code>.</td><td><code>ORDER BY column</code></td></tr>
+<tr><td><code>.limit(5)</code></td><td>Return no more than the requested number of rows.</td><td><code>LIMIT 5</code></td></tr></table>
+<p>Building <code>statement</code> is like composing a query plan description. It usually does not contact the database until a session executes it. The <code>==</code> in the expression is overloaded by SQLAlchemy: it constructs a SQL comparison rather than immediately comparing two ordinary Python values.</p>
+<h2>7. What scalar() and scalars() return</h2>
+<p>Both methods execute the statement through the session. Their difference is what they expose from the result:</p>
+<ul>
+<li><code>session.scalar(statement)</code> returns the first selected value from the first row, or <code>None</code> when there is no row. Use it when expecting one value/record, such as a row selected by a primary key or unique key.</li>
+<li><code>session.scalars(statement)</code> returns a result you can iterate over, containing the selected value from each row. Use it for zero, one, or many matching records.</li>
+<li><code>session.execute(statement)</code> exposes full rows/result objects and is useful when selecting several columns or expressions.</li>
+</ul>
+<pre># One matching ORM object, or None
+line = session.scalar(select(PurchaseOrderLineRecord).where(...))
+
+# Many ORM objects
+lines = session.scalars(select(PurchaseOrderLineRecord).where(...))
+for line in lines:
+    print(line.product_name)</pre>
+<p>Because the database constraint guarantees at most one matching line for an order/product pair, <code>scalar()</code> fits the current purchase-line query. Without uniqueness, it could hide the fact that multiple rows matched; use <code>scalars()</code> and inspect the collection if multiplicity matters.</p>
+<h2>8. What relationship loading means</h2>
+<p>ORM relationships may load related rows later, immediately, or in a batched follow-up query. The mapping currently says <code>lazy="selectin"</code> for order lines. When orders are loaded, SQLAlchemy fetches their lines with a second query using the set of order IDs. This avoids one line-query per order (the N+1 query problem).</p>
+<p>The per-query option <code>selectinload(PurchaseOrderRecord.lines)</code> can request the same strategy for one query. Since this mapping already sets it as the default, repeating the option there is redundant. Query options are useful when a particular query should load relationships differently from the mapping default.</p>
+<h2>9. Why functions appear in class declarations</h2>
+<p>Python class bodies execute when the class is defined. A line such as <code>lines = relationship(...)</code> calls the function <code>relationship</code> immediately. SQLAlchemy returns a special object (a descriptor) and stores that object as the class attribute. The descriptor knows how to provide relationship behavior on instances.</p>
+<pre>lines: Mapped[list["PurchaseOrderLineRecord"]] = relationship(
+    back_populates="purchase_order",
+    cascade="all, delete-orphan",
+    lazy="selectin",
+)</pre>
+<p>This does <strong>not</strong> mean each order's <code>lines</code> attribute is a function. It means the class declaration calls SQLAlchemy's mapping API to configure the attribute.</p>
+<h3>Call now versus pass for later</h3>
+<pre>column = mapped_column(String(200))  # calls mapped_column now
+callback = some_function             # stores/passes the function itself
+result = some_function()             # calls the function now</pre>
+<p>Frameworks sometimes accept callables so they can invoke them later. For example, a dataclass <code>default_factory=list</code> passes the callable <code>list</code>; the dataclass calls it separately for each instance. By contrast, <code>default=list()</code> calls it now and passes one already-created list. Avoid a shared mutable default.</p>
+<p>In this mapping, <code>relationship(...)</code> and <code>mapped_column(...)</code> are called in the class body; they return SQLAlchemy mapping objects. If an API accepts a function as a callback/default factory, look for whether the code passes <code>function</code> or calls <code>function()</code>.</p>
+<h2>10. Python syntax used in the project</h2>
+<table><tr><th>Syntax</th><th>How to read it</th></tr>
+<tr><td><code>Mapped[int]</code></td><td>A type annotation saying SQLAlchemy maps this attribute as an integer column.</td></tr>
+<tr><td><code>str | None</code></td><td>Either a string or <code>None</code>; modern union type syntax.</td></tr>
+<tr><td><code>list[PurchaseLine]</code></td><td>A list whose items should be <code>PurchaseLine</code> instances.</td></tr>
+<tr><td><code>field(default=..., init=False)</code></td><td>Dataclass field metadata; omit this field from the generated constructor and use the specified default.</td></tr>
+<tr><td><code>@property</code></td><td>Lets a method be read like an attribute, e.g. <code>order.total</code>.</td></tr>
+<tr><td><code>self._status = ...</code></td><td>Leading underscore conventionally marks an implementation detail; it is not strict privacy.</td></tr>
+<tr><td><code>[expr for item in items]</code></td><td>List comprehension: build a list by transforming each item.</td></tr>
+<tr><td><code>set(values)</code></td><td>Unique collection; comparing list and set lengths can detect duplicates.</td></tr>
+<tr><td><code>Enum</code> and <code>.value</code></td><td>Use named states in Python, store a stable primitive string such as <code>"draft"</code> in the database.</td></tr></table>
+<p>In the duplicate check, the list comprehension extracts every product ID. A set removes duplicates. If both lengths differ, at least one ID appeared more than once.</p>
+<h2>11. Sessions and transactions</h2>
+<p>A SQLAlchemy <code>Session</code> is a unit of work, not the database itself. It tracks objects, stages inserts/updates/deletes, executes queries, and coordinates a transaction.</p>
+<ul>
+<li><code>session.add(record)</code> stages a new ORM object for insertion.</li>
+<li><code>session.flush()</code> sends pending SQL inside the current transaction. It can obtain generated IDs, but it does not commit.</li>
+<li><code>commit</code> makes the transaction durable; <code>rollback</code> undoes its uncommitted changes.</li>
+</ul>
+<p>The database helper uses <code>sessionmaker.begin()</code> as a context manager: normal exit commits; an exception rolls back and is re-raised. Saving an order and its lines in one transaction means they succeed or fail together.</p>
+<p><code>@contextmanager</code> comes from Python's standard library. It turns a generator function with one <code>yield</code> into a <code>with</code>-compatible manager. The code before <code>yield</code> runs on entry; code after it runs on exit. Here SQLAlchemy already owns commit/rollback, and the wrapper provides a convenient session-scope API.</p>
+<h2>12. A practical learning loop</h2>
+<ol>
+<li>Read one small method and write down its inputs, output, and side effects.</li>
+<li>Rewrite a tiny version without SQLAlchemy. For example, filter a Python list by order ID and product ID.</li>
+<li>Translate the list operation into a <code>select(...).where(...)</code> statement.</li>
+<li>Predict the return type before calling <code>scalar()</code> or <code>scalars()</code>.</li>
+<li>Try invalid data and observe whether domain validation or the database constraint rejects it.</li>
+<li>Change one value after saving and query again to see which values were snapshots.</li>
+<li>Draw the tables, keys, and relationship arrows from memory.</li>
+</ol>
+<div class="callout"><strong>Manual recall prompt:</strong> Explain, without looking: why one order maps to many line rows; what the unique pair means; why a unit price is snapshotted; what <code>select()</code> constructs; when the query executes; and why <code>scalar()</code> fits one row.</div>
+<h2>13. Small exercises</h2>
+<ol>
+<li>Write a plain Python loop that finds all lines for one order. Then express the same condition in SQLAlchemy <code>.where()</code>.</li>
+<li>Remove the product ID from a line record in a scratch database. What does a required column prevent?</li>
+<li>Attempt to insert two lines with the same order ID and product ID. Identify which layer rejects it first.</li>
+<li>Change a product name and price after saving. Which database values should remain unchanged, and why?</li>
+<li>Make a statement select only <code>PurchaseOrderRecord.id</code>. Compare <code>scalar()</code> with <code>scalars()</code>.</li>
+<li>Remove <code>lazy="selectin"</code> in a scratch experiment and inspect how loading multiple orders affects query count.</li>
+</ol>
+<h2>14. Authentication versus authorization</h2>
+<p>Authentication answers <em>“who is making this request?”</em> Authorization answers <em>“may this identity perform this action?”</em> EDMS keeps them separate. Logging in proves identity; every protected route then checks a permission.</p>
+<table><tr><th>Concern</th><th>EDMS mechanism</th><th>Failure code</th></tr>
+<tr><td>Who are you?</td><td>Username + password, then a bearer token</td><td>401 Unauthorized</td></tr>
+<tr><td>Are you allowed?</td><td>Role-derived permission check</td><td>403 Forbidden</td></tr>
+<tr><td>Are you still active?</td><td><code>is_active</code> check on login and on every token lookup</td><td>403 Forbidden</td></tr></table>
+<p>The role is stored, but the permission set is <strong>derived</strong> from it:</p>
+<pre>class Role(Enum):
+    CEO = "ceo"
+    ADMINISTRATOR = "administrator"
+    SALES_OFFICER = "sales_officer"
+    # ...
+
+ROLE_PERMISSIONS: dict[Role, frozenset[str]] = {
+    Role.SALES_OFFICER: frozenset({
+        CATALOG_READ, INVENTORY_READ, SALES_READ, SALES_WRITE,
+    }),
+    # ...
+}
+
+class User:
+    @property
+    def permissions(self) -> frozenset[str]:
+        return ROLE_PERMISSIONS[self.role]
+
+    def has_permission(self, permission: str) -> bool:
+        return permission in self.permissions</pre>
+<ul>
+<li><strong>Derived permissions</strong> mean changing a role’s rules updates every user at once — no data migration. The trade-off: an old action cannot be audited by asking “what permissions did this user have then?” If that is required, snapshot the role on the audit record.</li>
+<li><strong><code>frozenset</code></strong> is immutable and gives average O(1) membership tests. A mutable <code>set</code> stored on a shared module constant could be edited by accident at runtime.</li>
+<li><strong><code>@property</code></strong> makes <code>user.permissions</code> read like data while it is computed on access. There is no <code>permissions</code> column in the database.</li>
+<li><strong>Strings as permission names</strong> (“catalog:write”) are stable identifiers at the boundary. Typos are runtime failures, so keeping them as module constants is safer than retyping literals.</li>
+</ul>
+<div class="callout"><strong>Mental model:</strong> authentication produces a <em>principal</em>; authorization consumes a <em>(principal, permission)</em> pair. The API dependency <code>require_permission(&quot;sales:write&quot;)</code> is the consumer; nothing in the domain layer knows HTTP exists.</div>
+
+<h2>15. Password hashing: salts, iterations, and constant-time comparison</h2>
+<p>Passwords are <strong>hashed</strong>, never encrypted. Encryption is reversible with a key; hashing is one-way. If the database leaks, the attacker should not be able to recover passwords or replay the stored value directly.</p>
+<pre>ALGORITHM = "pbkdf2_sha256"
+ITERATIONS = 260_000
+SALT_BYTES = 16
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(SALT_BYTES)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, ITERATIONS)
+    return f"{ALGORITHM}${ITERATIONS}${salt.hex()}${digest.hex()}"</pre>
+<table><tr><th>Pieces</th><th>Why it exists</th></tr>
+<tr><td>Salt (16 random bytes)</td><td>Two users with the same password get different hashes. Defeats precomputed rainbow tables.</td></tr>
+<tr><td>Iteration count (260,000)</td><td>Makes each guess expensive. A fast hash like plain SHA-256 is too cheap for passwords.</td></tr>
+<tr><td>Stored algorithm name</td><td>Allows a future migration to a different scheme while old hashes still verify.</td></tr>
+<tr><td><code>password.encode(&quot;utf-8&quot;)</code></td><td>Hashing functions operate on bytes, not <code>str</code>.</td></tr></table>
+<pre>def verify_password(password: str, stored_hash: str) -> bool:
+    algorithm, iterations, salt_hex, digest_hex = stored_hash.split("$")
+    if algorithm != ALGORITHM:
+        return False
+    candidate = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
+    )
+    return hmac.compare_digest(candidate, bytes.fromhex(digest_hex))</pre>
+<ul>
+<li><strong><code>compare_digest</code></strong> compares in constant time. A normal <code>==</code> can exit on the first differing byte, leaking timing information about how much of the hash was guessed correctly.</li>
+<li><strong>Recompute, do not decrypt.</strong> Verification hashes the supplied password with the stored salt and iterations, then compares digests.</li>
+<li><strong>Defensive parsing.</strong> The stored string <code>algorithm$iterations$salt$digest</code> is split and validated; malformed or unknown formats return <code>False</code> instead of raising.</li>
+<li><strong>Standard library only.</strong> PBKDF2 ships with Python, so the project needs no crypto dependency. Production systems often use Argon2id or bcrypt/scrypt, which are memory-hard.</li>
+</ul>
+
+<h2>16. Bearer tokens: opaque secrets stored as digests</h2>
+<p>After login the server issues an opaque random token. The client sends it in the <code>Authorization</code> header; the server looks up its digest.</p>
+<pre>def generate_token() -> str:
+    return secrets.token_urlsafe(32)      # ~256 bits of entropy
+
+def digest_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()</pre>
+<table><tr><th>Choice</th><th>Reason</th></tr>
+<tr><td>Random opaque token, not a JWT</td><td>No signing library, no parsing pitfalls, and revocation is a single row update.</td></tr>
+<tr><td>Store <code>sha256(token)</code>, not the token</td><td>A database leak does not hand over usable sessions. The raw token exists only in the client’s memory.</td></tr>
+<tr><td>Fast hash is acceptable here</td><td>The token already has ~256 bits of entropy, so brute-force guessing is infeasible. Passwords need slow hashes; random tokens do not.</td></tr>
+<tr><td><code>token_digest</code> is unique and indexed</td><td>Lookup by digest is the hot path on every authenticated request.</td></tr></table>
+<p>Expiry and revocation live in the token row: <code>expires_at</code> bounds the session, and <code>revoked_at</code> lets logout kill it before it expires. <code>resolve()</code> rejects both cases, so the check is centralized rather than repeated per route.</p>
+<div class="callout"><strong>Trade-off to notice:</strong> opaque tokens require a database lookup per request, but allow instant revocation. A stateless JWT avoids that lookup but cannot be revoked without extra state. EDMS chose revocation simplicity.</div>
+<p><strong>Never log tokens.</strong> A token in a log file is a working credential. The same applies to the raw <code>Authorization</code> header.</p>
+
+<h2>17. Time, expiry, and naive versus aware datetimes</h2>
+<pre>def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)</pre>
+<p>Python distinguishes <strong>naive</strong> datetimes (no timezone) from <strong>aware</strong> ones (carry <code>tzinfo</code>). Comparing or subtracting a naive and an aware datetime raises <code>TypeError</code>.</p>
+<ul>
+<li>The helper computes the current UTC time and strips <code>tzinfo</code>, so everything stored and compared follows one convention.</li>
+<li>The columns are <code>DateTime</code> without timezone support. Mixing conventions is a classic source of off-by-hours bugs and runtime errors.</li>
+<li><code>expires_at = utc_now() + ttl</code> is computed once, at token creation; later checks compare against a fresh <code>utc_now()</code>.</li>
+<li><strong>Server time is authoritative.</strong> The client never decides whether a token is still valid.</li>
+</ul>
+<p class="small">If the project ever needs multiple timezones or DST-aware reporting, switch to timezone-aware columns and convert only at the presentation boundary — do it deliberately, not by mixing.</p>
+
+<h2>18. Custom exceptions: structure, messages, and chaining</h2>
+<p>An exception class is a <em>type</em> that callers can catch precisely. It needs no methods to work; the class body only needs at least one statement. A docstring satisfies that, which is why replacing <code>pass</code> with a docstring changed nothing about behavior.</p>
+<pre>class InvalidTokenError(Exception):
+    """Raised when a bearer token is unknown, expired, or revoked."""
+
+    def __init__(self, reason: str = "Token is invalid or expired.") -> None:
+        super().__init__(reason)</pre>
+<ul>
+<li><strong><code>super().__init__(message)</code></strong> sets <code>args</code>, so <code>str(exc)</code> and traceback printing show a useful message. Without it, the exception prints with no detail.</li>
+<li><strong>Extra attributes</strong> (<code>self.username</code>, <code>self.permission</code>, <code>self.value</code>) let upper layers respond programmatically instead of parsing text.</li>
+<li><strong>Catch by type</strong>: <code>except InvalidCredentialsError</code> does not accidentally swallow unrelated <code>ValueError</code>s.</li>
+<li><strong>Raise with a cause</strong>: <code>raise CategoryAlreadyExistsError(name) from error</code> preserves the original <code>IntegrityError</code> as <code>__cause__</code>, so the traceback shows both.</li>
+</ul>
+<pre>try:
+    session.flush()
+except IntegrityError as error:
+    session.rollback()
+    raise CategoryAlreadyExistsError(category.name) from error</pre>
+<p>This converts a database-specific failure into a domain-specific one at the repository boundary. The API layer then maps that single type to HTTP 409 without knowing SQLAlchemy exists.</p>
+
+<h2>19. The bootstrap pattern and the TOCTOU race</h2>
+<pre>def bootstrap_admin(self, username, email, password) -> User:
+    if self.user_repository.count() &gt; 0:
+        raise PermissionDeniedError("auth:manage")
+    return self.register_user(username, email, password, Role.ADMINISTRATOR)</pre>
+<p>Registration requires <code>auth:manage</code>, which nobody holds until an administrator exists. The bootstrap endpoint breaks that circular dependency by allowing exactly one unauthenticated administrator creation.</p>
+<p>This is a <strong>TOCTOU</strong> check (“time of check to time of use”): two simultaneous bootstrap requests could both read <code>count() == 0</code> before either inserts. The check narrows the window; it does not close it.</p>
+<ul>
+<li>Real protection comes from the database: a uniqueness rule (for example a singleton row or unique username) plus a transaction. The second writer fails and rolls back.</li>
+<li>The <code>403</code> here means “bootstrap already used”, not “you are not logged in” — a deliberate distinction worth documenting in the API.</li>
+<li>In production, bootstrap is usually a one-off CLI task or an environment-gated endpoint, not an open public route.</li>
+</ul>
+
+<h2>20. FastAPI fundamentals: ASGI, app factory, routers</h2>
+<p>FastAPI runs on ASGI, the asynchronous server interface implemented by Uvicorn. A request travels: server → middleware → router → dependencies → endpoint → response model → server.</p>
+<pre>def create_app(database_url: str = "sqlite:///edms.db") -&gt; FastAPI:
+    database = Database(database_url)
+    database.create_schema()
+
+    app = FastAPI(title="EDMS API", version="1.0.0")
+    app.state.database = database
+
+    for module in (auth, catalog, inventory, sales, procurement, logistics, reporting):
+        app.include_router(module.router, prefix="/api")
+
+    return app</pre>
+<table><tr><th>Concept</th><th>Meaning in EDMS</th></tr>
+<tr><td>App factory</td><td><code>create_app(url)</code> builds a configured app. Tests pass a temporary database URL instead of touching the real file.</td></tr>
+<tr><td>Router</td><td>One module per business area with <code>prefix</code> and <code>tags</code>, so paths and docs stay grouped.</td></tr>
+<tr><td><code>app.state</code></td><td>Attach shared, long-lived objects (the <code>Database</code>) to the app instance; routes reach them through <code>request.app.state</code>.</td></tr>
+<tr><td>OpenAPI</td><td>FastAPI derives a machine-readable schema from routes and Pydantic models; <code>/docs</code> renders it.</td></tr></table>
+<p>Creating the schema inside <code>create_app</code> makes startup explicit and keeps tests self-contained. A production deployment would normally run migrations instead.</p>
+
+<h2>21. Dependency injection and the per-request session</h2>
+<p><code>Depends</code> declares that an endpoint needs something; FastAPI builds it, in the right order, before calling the function.</p>
+<pre>def get_database(request: Request) -&gt; Database:
+    return request.app.state.database
+
+def get_session(database: Database = Depends(get_database)):
+    with database.session_scope() as session:
+        yield session</pre>
+<ul>
+<li><strong>Generator dependencies</strong> use <code>yield</code> to separate setup from teardown. Code before <code>yield</code> runs before the endpoint; the block after it runs when the request finishes.</li>
+<li><strong>One session per request</strong>, shared by the auth service and the route: FastAPI caches dependency results within a request by default, so <code>get_session</code> is not called twice.</li>
+<li><strong>The request is one transaction.</strong> <code>session_scope()</code> commits on normal exit. If the endpoint raises, the exception passes through the context manager, which rolls back — so a half-finished sales order never commits.</li>
+<li><strong><code>expire_on_commit=False</code></strong> keeps already-loaded attributes usable after commit instead of marking them stale and forcing a refresh query.</li>
+<li><strong>Teardown order matters.</strong> Response values are built while the request is still active. After teardown the session closes; touching an unloaded lazy attribute later raises <code>DetachedInstanceError</code>. That is why routers convert domain objects into Pydantic responses inside the endpoint.</li>
+</ul>
+<pre>def require_permission(permission: str):
+    def checker(user: User = Depends(get_current_user)) -&gt; User:
+        if not user.has_permission(permission):
+            raise HTTPException(status_code=403, detail=...)
+        return user
+    return checker
+
+# used as
+current_user: User = Depends(require_permission(&quot;sales:write&quot;))</pre>
+<p>This is a <strong>dependency factory</strong>: calling <code>require_permission(...)</code> returns a new callable that captures the permission. The returned dependency is what <code>Depends</code> receives.</p>
+<div class="callout"><strong>Testing hook:</strong> <code>app.dependency_overrides[get_session] = fake</code> can swap a real dependency for a test double. EDMS’s API tests instead build the app with a temporary SQLite file, which exercises the real stack.</div>
+
+<h2>22. Pydantic models: the validation boundary</h2>
+<pre>class SalesLineIn(BaseModel):
+    configuration_id: int
+    quantity: int
+    unit_price: Decimal | None = None
+
+class SalesOrderCreate(BaseModel):
+    customer: CustomerIn
+    warehouse_id: str
+    lines: list[SalesLineIn]</pre>
+<ul>
+<li><strong>Request models validate and coerce.</strong> JSON strings such as <code>"5.00"</code> become <code>Decimal</code>; invalid shapes produce <code>422</code> before any business code runs.</li>
+<li><strong>Nested models</strong> compose: <code>SalesOrderCreate</code> contains <code>CustomerIn</code> and a list of <code>SalesLineIn</code>.</li>
+<li><strong><code>Field(default_factory=list)</code></strong> creates a fresh list per model instead of sharing one mutable default.</li>
+<li><strong><code>model_dump()</code></strong> turns a model into a plain dictionary for code that expects dicts, such as the sales service’s line input.</li>
+<li><strong>Response models filter.</strong> <code>UserResponse</code> lists only public fields, so <code>password_hash</code> can never leak even if someone adds it to the returned object.</li>
+<li><strong>Decimal precision.</strong> Money is kept as <code>Decimal</code>; JSON serialization typically emits it as a string to preserve exactness, so clients should parse rather than assume a float.</li>
+</ul>
+<p>Two different failure modes are worth separating: a <strong>422</strong> means the request body did not match the schema; a <strong>400</strong> means the body was well formed but the business rule rejected it (for example, a configuration ID that does not exist).</p>
+
+<h2>23. Mapping domain errors to HTTP without polluting the domain</h2>
+<pre>ERROR_STATUS_CODES = {
+    InvalidCredentialsError: 401,
+    InvalidTokenError: 401,
+    InactiveUserError: 403,
+    PermissionDeniedError: 403,
+    UsernameAlreadyExistsError: 409,
+    CategoryAlreadyExistsError: 409,
+    ValueError: 400,
+}
+
+def _error_handler(status_code: int):
+    async def handler(request: Request, exc: Exception) -&gt; JSONResponse:
+        return JSONResponse(status_code=status_code, content={"detail": str(exc)})
+    return handler
+
+for error_type, status_code in ERROR_STATUS_CODES.items():
+    app.add_exception_handler(error_type, _error_handler(status_code))</pre>
+<ul>
+<li><strong>Services and repositories stay HTTP-free.</strong> They raise <code>ValueError</code> or a domain exception. Only the app factory knows status codes.</li>
+<li><strong>Subclass matching.</strong> When an exception is raised, the framework searches the exception’s class hierarchy for a registered handler, so specific types win when both a base and a subclass are registered.</li>
+<li><strong>The factory avoids a classic bug.</strong> Inside <code>_error_handler(status_code)</code>, each handler closes over its <em>own</em> parameter. If the handler were defined directly in the loop, every closure would share the loop variable and all responses would use the final status code — Python closures capture variables, not values.</li>
+<li><strong>Trade-off:</strong> mapping the broad <code>ValueError</code> to 400 is convenient but can disguise genuine bugs as client errors. A dedicated validation-exception base class becomes worthwhile as the project grows.</li>
+</ul>
+
+<h2>24. HTTP semantics used by the API</h2>
+<table><tr><th>Code</th><th>When EDMS uses it</th><th>Meaning</th></tr>
+<tr><td>200</td><td>Successful reads and lifecycle actions</td><td>Request succeeded with a body</td></tr>
+<tr><td>201</td><td>Creating a category, product, order, lot, user</td><td>A new resource exists</td></tr>
+<tr><td>204</td><td>Logout</td><td>Success, deliberately no body</td></tr>
+<tr><td>400</td><td>Unknown configuration ID, invalid lifecycle transition</td><td>Well-formed request, rule violation</td></tr>
+<tr><td>401</td><td>Missing/malformed header, bad token, wrong password</td><td>Identity not established</td></tr>
+<tr><td>403</td><td>Insufficient permission, inactive user</td><td>Identity known, action refused</td></tr>
+<tr><td>404</td><td>Unknown product, order, shipment</td><td>Resource not found</td></tr>
+<tr><td>409</td><td>Duplicate username, category, or specification</td><td>Conflicts with current state</td></tr>
+<tr><td>422</td><td>Body fails Pydantic validation</td><td>Schema mismatch (framework-level)</td></tr></table>
+<pre>def get_bearer_token(authorization: str | None = Header(default=None)) -&gt; str:
+    if not authorization or not authorization.lower().startswith(&quot;bearer &quot;):
+        raise HTTPException(
+            status_code=401,
+            detail=&quot;Missing or malformed Authorization header.&quot;,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return authorization.split(&quot; &quot;, 1)[1].strip()</pre>
+<ul>
+<li><strong>Scheme check is case-insensitive</strong>, as the HTTP specification requires.</li>
+<li><strong><code>split(&quot; &quot;, 1)</code></strong> splits only on the first space, so a token that contained a space would not be silently truncated at the wrong place.</li>
+<li><strong><code>WWW-Authenticate: Bearer</code></strong> tells compliant clients which scheme to use.</li>
+<li><strong>POST actions versus PATCH state.</strong> <code>/orders/{id}/pay</code> names a business operation; <code>PATCH /orders/{id}/status</code> sets a field. Naming operations as endpoints keeps lifecycle rules server-side instead of trusting a client-supplied status.</li>
+</ul>
+
+<h2>25. Testing an API in-process</h2>
+<pre>self.tmpdir = tempfile.mkdtemp()
+database_url = f&quot;sqlite:///{os.path.join(self.tmpdir, 'test.db')}&quot;
+self.app = create_app(database_url)
+self.client = TestClient(self.app)</pre>
+<ul>
+<li><strong>No network.</strong> <code>TestClient</code> calls the ASGI app directly — real routing, dependency injection, validation, and exception handlers, without starting Uvicorn.</li>
+<li><strong>File, not <code>sqlite://</code>.</strong> An in-memory SQLite database lives inside one connection; a pool that opens a second connection sees an empty database with no tables. A temporary file gives every connection the same data.</li>
+<li><strong>Isolation per test.</strong> A fresh directory per test method means no ordering dependencies. <code>tearDown</code> disposes the engine and removes the file.</li>
+<li><strong>Assert on status and body.</strong> Permission tests assert 403 for a forbidden write and 200 for an allowed read — proving both halves of the rule.</li>
+<li><strong>Warnings are not failures.</strong> The environment prints a <code>StarletteDeprecationWarning</code> about <code>httpx</code>; it comes from the installed Starlette version, not from EDMS code.</li>
+</ul>
+<p>Testing through HTTP catches wiring problems that unit tests miss: a missing schema model, a router included with the wrong prefix, a domain error that never maps to a status code.</p>
+
+<h2>26. Practice: API and authentication exercises</h2>
+<ol>
+<li>Create two users with the identical password and compare their stored hashes. Explain the difference using the salt.</li>
+<li>Call <code>/api/auth/me</code> with no header, with <code>Basic</code>, and with a revoked token. Record the status codes and explain each.</li>
+<li>Log in, then deactivate the user in the database and reuse the token. Which check rejects it, and with which code?</li>
+<li>Add a new role to <code>ROLE_PERMISSIONS</code> and verify a forbidden route becomes allowed without touching any router.</li>
+<li>Remove <code>required</code> from a Pydantic field and observe the 422 response body. Then send a well-formed request that breaks a business rule and compare the 400.</li>
+<li>Make an endpoint raise <code>ValueError</code> after a successful <code>flush()</code>. Confirm the transaction rolled back by checking the database.</li>
+<li>Predict, before running, why the handler factory in section 23 would break if it were written inline in the loop.</li>
+<li>Write an API test that proves a sales officer cannot approve a purchase order, then explain which dependency produced the 403.</li>
+</ol>
+
+<h2>27. Source map</h2>
+<ul>
+<li><code>procurement/models/purchase_order.py</code>: domain behavior, lifecycle, totals, duplicate validation.</li>
+<li><code>procurement/models/purchase_line.py</code>: quantity/price validation and receipt behavior.</li>
+<li><code>procurement/repositories/purchase_order_repository.py</code>: ORM mapping, constraints, query construction, domain-to-record mapping.</li>
+<li><code>procurement/services/purchase_line_service.py</code>: service delegation to the order repository.</li>
+<li><code>shared/database.py</code>: engine, session factory, schema creation, and transaction context.</li>
+<li><code>authentication/security.py</code>: PBKDF2 hashing, token generation, and token digests.</li>
+<li><code>authentication/models/user.py</code>: roles, permission constants, role mapping, and the <code>User</code> model.</li>
+<li><code>authentication/repositories/user_repository.py</code>: user and token ORM records, expiry/revocation lookup, and unique constraints.</li>
+<li><code>authentication/services/authentication_service.py</code>: registration, bootstrap, login, token authentication, and permission checks.</li>
+<li><code>authentication/exceptions.py</code>: typed errors that carry structured context.</li>
+<li><code>API/main.py</code>: app factory, router registration, and domain-error-to-HTTP mapping.</li>
+<li><code>API/dependencies.py</code>: per-request session, auth service, bearer parsing, current user, and permission dependency factory.</li>
+<li><code>API/schemas.py</code>: Pydantic request/response models.</li>
+<li><code>API/routers/*.py</code>: thin HTTP endpoints per business area.</li>
+<li><code>tests/purchase_line_tests.py</code>: behavior and database-constraint examples.</li>
+<li><code>tests/api_tests.py</code>: authentication, authorization, status-code mapping, and end-to-end HTTP flows.</li>
+</ul>
+<p class="small">Built as a learning aid for the EDMS catalog, inventory, procurement, sales, logistics, reporting, authentication, and API slices. Database schemas and framework APIs evolve; use migrations for changes to existing databases, and verify behavior against the actual database engine and dependency versions used in deployment.</p>
+</body>
+</html>

@@ -1,39 +1,51 @@
+from decimal import Decimal
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from catalog.repositories.records import ProductPriceRecord
 from shared.logging import log
 
+
 class PricingRepository:
-    """
-    The repository for persisting and retrieving pricing info for the business
-    """
-    def __init__(self, products_price_list: dict):
-        """
-        Initializes the PricingRepository with a dictionary of product prices.
-        """
-        self.price_list = products_price_list if products_price_list else {}
-        pass
+    """Persist product-level fallback prices in the catalog database."""
 
-    def save_price(self, product: str, price: int):
-        """
-        Saves the price of a product in the price list.
-        """
-        self.price_list[product] = price
+    def __init__(self, db_session: Session):
+        self.db_session = db_session
 
-    def edit_price(self, product: str, amount: int):
-        """
-        Edits the price of a product in the price list.
-        """
-        for product_name, unit_price in self.price_list.items():
-            if product_name == product:
-                self.price_list[product_name] = amount
-                log(f"{product_name} old price removed, new unit price {unit_price} is set!")
+    def save_price(self, product: str, price: Decimal | int | str) -> None:
+        price_value = Decimal(str(price))
+        if price_value < 0:
+            raise ValueError("Product price cannot be negative.")
+        record = self.db_session.get(ProductPriceRecord, product)
+        if record is None:
+            record = ProductPriceRecord(product_name=product, unit_price=price_value)
+            self.db_session.add(record)
+        else:
+            record.unit_price = price_value
+        self.db_session.flush()
 
-    def get_price(self, product: str):
-        """
-        Retrieves the price of a product from the price list.
-        """
-        for product_name, unit_price in self.price_list.items():
-            if product_name == product:
-                return unit_price
+    def edit_price(self, product: str, amount: Decimal | int | str) -> None:
+        record = self.db_session.get(ProductPriceRecord, product)
+        if record is None:
+            raise ValueError(f"No price is recorded for '{product}'.")
+        price_value = Decimal(str(amount))
+        if price_value < 0:
+            raise ValueError("Product price cannot be negative.")
+        old_price = record.unit_price
+        record.unit_price = price_value
+        self.db_session.flush()
+        log(f"{product} price changed from {old_price} to {price_value}.")
+
+    def get_price(self, product: str) -> Decimal | None:
+        return self.db_session.scalar(
+            select(ProductPriceRecord.unit_price).where(
+                ProductPriceRecord.product_name == product
+            )
+        )
 
     @staticmethod
-    def total(unit_price: int, quantity: int):
+    def total(unit_price: Decimal, quantity: int) -> Decimal:
+        if quantity < 0:
+            raise ValueError("Quantity cannot be negative.")
         return unit_price * quantity

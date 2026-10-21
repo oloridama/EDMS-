@@ -1,57 +1,95 @@
 from decimal import Decimal
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
 from catalog.models.product import Product
-from catalog.models.product_configuration import ProductConfiguration
+from catalog.repositories.mappers import product_from_record
+from catalog.repositories.records import CategoryRecord, ProductRecord
 from shared.logging import log
 
+
 class ProductRepository:
-    """
-    class object with methods for performing the business operations
-    """
-    def __init__(self, catalog: list[Product]):
-        """
-        Initializes the ProductRepository with an optional catalog of products.
-        :param catalog: A list of Product instances representing the product catalog
-        """
-        self.catalog = catalog if catalog else []
+    def __init__(self, db_session: Session):
+        self.db_session = db_session
 
-    def add_product(self, product: Product):
-        """
-        The method handles the business operation of persisting \
-        the product intended to be added when called
-        :param product: An instance of Product to be added to the catalog
-        """
-        self.catalog.append(product)
+    def add_product(self, product: Product) -> str:
+        category = self.db_session.scalar(
+            select(CategoryRecord).where(CategoryRecord.name == product.category.name)
+        )
+        if category is None:
+            raise ValueError(f"Category '{product.category.name}' was not found.")
 
-    def remove_product(
-            self, 
-            products_catalog: list, 
-            product_name: str
-        ) -> None:
-        """
-        The method handles the deletion of product from the business catalog
-            :param products_catalog: This is the catalog to be deleted from
-            :param product_name: This is the name of the product to be deleted from the catalog
-        """
-        for product in products_catalog:
-            if product.name == product_name:
-                products_catalog.remove(product)
-                log.info(f"Product {product_name} removed from catalog")
-                return
-        log.warning(f"Product not found in catalog: {product_name}")
+        existing = self.db_session.get(ProductRecord, product.product_id)
+        if existing is not None:
+            raise ValueError(f"Product '{product.product_id}' already exists.")
+
+        record = ProductRecord(
+            product_id=product.product_id,
+            name=product.name,
+            description=product.description,
+            brand_name=product.brand.name,
+            category_id=category.id,
+        )
+        self.db_session.add(record)
+        self.db_session.flush()
+        return record.product_id
+
+    def get_product(self, product_id: str) -> Product | None:
+        record = self.db_session.scalar(
+            select(ProductRecord)
+            .options(
+                selectinload(ProductRecord.category).selectinload(
+                    CategoryRecord.specification_types
+                ),
+                selectinload(ProductRecord.configurations),
+            )
+            .where(ProductRecord.product_id == product_id)
+        )
+        return product_from_record(record) if record else None
+
+    def get_product_by_name(self, product_name: str) -> Product | None:
+        record = self.db_session.scalar(
+            select(ProductRecord)
+            .options(
+                selectinload(ProductRecord.category).selectinload(
+                    CategoryRecord.specification_types
+                ),
+                selectinload(ProductRecord.configurations),
+            )
+            .where(ProductRecord.name == product_name)
+            .order_by(ProductRecord.product_id)
+        )
+        return product_from_record(record) if record else None
+
+    def remove_product(self, product_name: str) -> None:
+        record = self.db_session.scalar(
+            select(ProductRecord).where(ProductRecord.name == product_name)
+        )
+        if record is None:
+            raise ValueError(f"Product '{product_name}' was not found.")
+        self.db_session.delete(record)
+        self.db_session.flush()
+        log.info(f"Product {product_name} removed from catalog")
 
     def check_product_unit_price(
-            self, 
-            product_name: str
-        ) -> Decimal | None:
-        """
-        The method handles the retrieval of the unit price \
-            of a product in the catalog
-            :param product_name: This is the name of the product \
-                whose unit price is to be retrieved
-            :return: The unit price of the product if found, else None
-        """
-        for product in self.catalog:
-            if product_name == product.name:
-                return product.unit_price 
-        return None
+        self,
+        product_name: str,
+        quantity: int = 1,
+    ) -> Decimal | None:
+        product = self.get_product_by_name(product_name)
+        if product is None:
+            return None
+
+        matching_prices = [
+            rule.unit_price
+            for configuration in product.configurations
+            for rule in configuration.pricing.pricing_rules
+            if (rule.min_quantity is None or quantity >= rule.min_quantity)
+            and (rule.max_quantity is None or quantity <= rule.max_quantity)
+        ]
+        if len(matching_prices) > 1:
+            raise ValueError(
+                f"Multiple pricing tiers match '{product_name}' at quantity {quantity}."
+            )
+        return matching_prices[0] if matching_prices else None
